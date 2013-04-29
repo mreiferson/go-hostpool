@@ -6,6 +6,7 @@ package hostpool
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,8 +15,6 @@ func Version() string {
 	return "0.1"
 }
 
-// --- Response interfaces and structs ----
-
 // This interface represents the response from HostPool. You can retrieve the
 // hostname by calling Host(), and after making a request to the host you should
 // call Mark with any error encountered, which will inform the HostPool issuing
@@ -23,60 +22,61 @@ func Version() string {
 type HostPoolResponse interface {
 	Host() string
 	Mark(error)
-	hostPool() HostPool
 }
 
 type standardHostPoolResponse struct {
-	host string
-	sync.Once
-	pool HostPool
+	replied int32
+	host    string
+	pool    *standardHostPool
 }
 
-// --- HostPool structs and interfaces ----
+func (r *standardHostPoolResponse) Host() string {
+	return r.host
+}
+
+func (r *standardHostPoolResponse) Mark(err error) {
+	if !atomic.CompareAndSwapInt32(&r.replied, 0, 1) {
+		return
+	}
+
+	if err == nil {
+		r.pool.markSuccess(r)
+	} else {
+		r.pool.markFailed(r)
+	}
+}
 
 // This is the main HostPool interface. Structs implementing this interface
 // allow you to Get a HostPoolResponse (which includes a hostname to use),
 // get the list of all Hosts, and use ResetAll to reset state.
 type HostPool interface {
 	Get() HostPoolResponse
-	// keep the marks separate so we can override independently
-	markSuccess(HostPoolResponse)
-	markFailed(HostPoolResponse)
-
 	ResetAll()
 	Hosts() []string
 }
 
 type standardHostPool struct {
 	sync.RWMutex
-	hosts             map[string]*hostEntry
-	hostList          []*hostEntry
-	initialRetryDelay time.Duration
-	maxRetryInterval  time.Duration
-	nextHostIndex     int
+	hosts         map[string]*hostEntry
+	hostList      []*hostEntry
+	initialRetry  time.Duration
+	maxRetry      time.Duration
+	nextHostIndex int
 }
 
-// ------ constants -------------------
-
-const epsilonBuckets = 120
-const epsilonDecay = 0.90 // decay the exploration rate
-const minEpsilon = 0.01   // explore one percent of the time
-const initialEpsilon = 0.3
-const defaultDecayDuration = time.Duration(5) * time.Minute
-
 // Construct a basic HostPool using the hostnames provided
-func New(hosts []string) HostPool {
+func New(hosts []string, initialRetry time.Duration, maxRetry time.Duration) HostPool {
 	p := &standardHostPool{
-		hosts:             make(map[string]*hostEntry, len(hosts)),
-		hostList:          make([]*hostEntry, len(hosts)),
-		initialRetryDelay: time.Duration(30) * time.Second,
-		maxRetryInterval:  time.Duration(900) * time.Second,
+		hosts:        make(map[string]*hostEntry, len(hosts)),
+		hostList:     make([]*hostEntry, len(hosts)),
+		initialRetry: initialRetry,
+		maxRetry:     maxRetry,
 	}
 
 	for i, h := range hosts {
 		e := &hostEntry{
 			host:       h,
-			retryDelay: p.initialRetryDelay,
+			retryDelay: p.initialRetry,
 		}
 		p.hosts[h] = e
 		p.hostList[i] = e
@@ -85,26 +85,12 @@ func New(hosts []string) HostPool {
 	return p
 }
 
-func (r *standardHostPoolResponse) Host() string {
-	return r.host
-}
-
-func (r *standardHostPoolResponse) hostPool() HostPool {
-	return r.pool
-}
-
-func (r *standardHostPoolResponse) Mark(err error) {
-	r.Do(func() {
-		doMark(err, r)
-	})
-}
-
-func doMark(err error, r HostPoolResponse) {
-	if err == nil {
-		r.hostPool().markSuccess(r)
-	} else {
-		r.hostPool().markFailed(r)
+func (p *standardHostPool) Hosts() []string {
+	hosts := make([]string, len(p.hosts))
+	for host, _ := range p.hosts {
+		hosts = append(hosts, host)
 	}
+	return hosts
 }
 
 // return an entry from the HostPool
@@ -118,17 +104,15 @@ func (p *standardHostPool) Get() HostPoolResponse {
 func (p *standardHostPool) getRoundRobin() string {
 	now := time.Now()
 	hostCount := len(p.hostList)
-	for i := range p.hostList {
-		// iterate via sequenece from where we last iterated
-		currentIndex := (i + p.nextHostIndex) % hostCount
-
+	for i := 0; i < hostCount; i++ {
+		currentIndex := (p.nextHostIndex + i) % hostCount
 		h := p.hostList[currentIndex]
 		if !h.dead {
 			p.nextHostIndex = currentIndex + 1
 			return h.host
 		}
 		if h.nextRetry.Before(now) {
-			h.willRetryHost(p.maxRetryInterval)
+			h.willRetryHost(p.maxRetry)
 			p.nextHostIndex = currentIndex + 1
 			return h.host
 		}
@@ -155,8 +139,7 @@ func (p *standardHostPool) doResetAll() {
 	}
 }
 
-func (p *standardHostPool) markSuccess(hostR HostPoolResponse) {
-	host := hostR.Host()
+func (p *standardHostPool) markSuccess(host string) {
 	p.Lock()
 	defer p.Unlock()
 
@@ -167,10 +150,10 @@ func (p *standardHostPool) markSuccess(hostR HostPoolResponse) {
 	h.dead = false
 }
 
-func (p *standardHostPool) markFailed(hostR HostPoolResponse) {
-	host := hostR.Host()
+func (p *standardHostPool) markFailed(host string) {
 	p.Lock()
 	defer p.Unlock()
+
 	h, ok := p.hosts[host]
 	if !ok {
 		log.Fatalf("host %s not in HostPool %v", host, p.Hosts())
@@ -178,15 +161,7 @@ func (p *standardHostPool) markFailed(hostR HostPoolResponse) {
 	if !h.dead {
 		h.dead = true
 		h.retryCount = 0
-		h.retryDelay = p.initialRetryDelay
+		h.retryDelay = p.initialRetry
 		h.nextRetry = time.Now().Add(h.retryDelay)
 	}
-
-}
-func (p *standardHostPool) Hosts() []string {
-	hosts := make([]string, len(p.hosts))
-	for host, _ := range p.hosts {
-		hosts = append(hosts, host)
-	}
-	return hosts
 }

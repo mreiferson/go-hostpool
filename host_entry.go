@@ -29,13 +29,13 @@ func (h *hostEntry) canTryHost(now time.Time) bool {
 	return false
 }
 
-func (h *hostEntry) willRetryHost(maxRetryInterval time.Duration) {
+func (h *hostEntry) willRetryHost(maxRetry time.Duration) {
 	h.retryCount += 1
 	newDelay := h.retryDelay * 2
-	if newDelay < maxRetryInterval {
+	if newDelay < maxRetry {
 		h.retryDelay = newDelay
 	} else {
-		h.retryDelay = maxRetryInterval
+		h.retryDelay = maxRetry
 	}
 	h.nextRetry = time.Now().Add(h.retryDelay)
 }

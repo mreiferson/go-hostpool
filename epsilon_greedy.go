@@ -3,57 +3,75 @@ package hostpool
 import (
 	"log"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const epsilonBuckets = 120
+const epsilonDecay = 0.90 // decay the exploration rate
+const minEpsilon = 0.01   // explore one percent of the time
+const initialEpsilon = 0.3
+const defaultDecayDuration = time.Duration(5) * time.Minute
+
 type epsilonHostPoolResponse struct {
-	standardHostPoolResponse
+	replied int32
+	host    string
+	pool    *epsilonGreedyHostPool
 	started time.Time
 	ended   time.Time
 }
 
-func (r *epsilonHostPoolResponse) Mark(err error) {
-	r.Do(func() {
-		r.ended = time.Now()
-		doMark(err, r)
-	})
+func (r *epsilonHostPoolResponse) Host() string {
+	return r.host
+}
 
+func (r *epsilonHostPoolResponse) Mark(err error) {
+	if !atomic.CompareAndSwapInt32(&r.replied, 0, 1) {
+		return
+	}
+
+	r.ended = time.Now()
+	if err == nil {
+		r.pool.markSuccess(r)
+	} else {
+		r.pool.markFailed(r)
+	}
 }
 
 type epsilonGreedyHostPool struct {
-	standardHostPool               // TODO - would be nifty if we could embed HostPool and Locker interfaces
-	epsilon                float32 // this is our exploration factor
-	decayDuration          time.Duration
-	EpsilonValueCalculator // embed the epsilonValueCalculator
+	sync.RWMutex
 	timer
+	standardPool *standardHostPool
+	EpsilonValueCalculator
+	epsilon       float32
+	decayDuration time.Duration
 }
 
 // Construct an Epsilon Greedy HostPool
 //
-// Epsilon Greedy is an algorithm that allows HostPool not only to track failure state, 
+// Epsilon Greedy is an algorithm that allows HostPool not only to track failure state,
 // but also to learn about "better" options in terms of speed, and to pick from available hosts
 // based on how well they perform. This gives a weighted request rate to better
 // performing hosts, while still distributing requests to all hosts (proportionate to their performance).
 // The interface is the same as the standard HostPool, but be sure to mark the HostResponse immediately
 // after executing the request to the host, as that will stop the implicitly running request timer.
-// 
+//
 // A good overview of Epsilon Greedy is here http://stevehanov.ca/blog/index.php?id=132
 //
 // To compute the weighting scores, we perform a weighted average of recent response times, over the course of
 // `decayDuration`. decayDuration may be set to 0 to use the default value of 5 minutes
 // We then use the supplied EpsilonValueCalculator to calculate a score from that weighted average response time.
 func NewEpsilonGreedy(hosts []string, decayDuration time.Duration, calc EpsilonValueCalculator) HostPool {
-
 	if decayDuration <= 0 {
 		decayDuration = defaultDecayDuration
 	}
-	stdHP := New(hosts).(*standardHostPool)
+
 	p := &epsilonGreedyHostPool{
-		standardHostPool:       *stdHP,
+		timer: &realTimer{},
+		EpsilonValueCalculator: calc,
 		epsilon:                float32(initialEpsilon),
 		decayDuration:          decayDuration,
-		EpsilonValueCalculator: calc,
-		timer:                  &realTimer{},
 	}
 
 	// allocate structures
@@ -76,23 +94,21 @@ func (p *epsilonGreedyHostPool) epsilonGreedyDecay() {
 	ticker := time.Tick(durationPerBucket)
 	for {
 		<-ticker
-		p.performEpsilonGreedyDecay()
+		p.Lock()
+		for _, h := range p.hostList {
+			h.epsilonIndex += 1
+			h.epsilonIndex = h.epsilonIndex % epsilonBuckets
+			h.epsilonCounts[h.epsilonIndex] = 0
+			h.epsilonValues[h.epsilonIndex] = 0
+		}
+		p.Unlock()
 	}
-}
-func (p *epsilonGreedyHostPool) performEpsilonGreedyDecay() {
-	p.Lock()
-	for _, h := range p.hostList {
-		h.epsilonIndex += 1
-		h.epsilonIndex = h.epsilonIndex % epsilonBuckets
-		h.epsilonCounts[h.epsilonIndex] = 0
-		h.epsilonValues[h.epsilonIndex] = 0
-	}
-	p.Unlock()
 }
 
 func (p *epsilonGreedyHostPool) Get() HostPoolResponse {
 	p.Lock()
 	defer p.Unlock()
+
 	host := p.getEpsilonGreedy()
 	started := time.Now()
 	return &epsilonHostPoolResponse{
@@ -113,7 +129,7 @@ func (p *epsilonGreedyHostPool) getEpsilonGreedy() string {
 		return p.getRoundRobin()
 	}
 
-	// calculate values for each host in the 0..1 range (but not ormalized)
+	// calculate values for each host in the 0..1 range (but not normalized)
 	var possibleHosts []*hostEntry
 	now := time.Now()
 	var sumValues float64
@@ -155,7 +171,7 @@ func (p *epsilonGreedyHostPool) getEpsilonGreedy() string {
 	}
 
 	if hostToUse.dead {
-		hostToUse.willRetryHost(p.maxRetryInterval)
+		hostToUse.willRetryHost(p.maxRetry)
 	}
 	return hostToUse.host
 }
